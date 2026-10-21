@@ -1,0 +1,138 @@
+# Builds whatever is currently pinned, so a hand-edited sources.json or a
+# change to the packaging gets the same verification the update bot performs.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Check formatting
+        run: nix develop --command sh -c 'nixfmt --check $(git ls-files "*.nix")'
+
+      - name: Shellcheck the updater
+        run: nix develop --command shellcheck scripts/update.sh
+
+      - name: Evaluate every flake output
+        run: nix flake show --all-systems
+
+      - name: Updater still finds upstream releases
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: nix run .#update -- --dry-run
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Build the pinned Tabby for ${{ matrix.system }}
+        run: |
+          nix build --print-build-logs --no-link \
+            ".#checks.${{ matrix.system }}.tabby" \
+            ".#checks.${{ matrix.system }}.tabby-startup"
+
+  modules:
+    # Cheap guard that both modules still evaluate and actually install Tabby.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Evaluate the NixOS module
+        run: |
+          nix eval --raw --impure --expr '
+            let
+              flake = builtins.getFlake (toString ./.);
+              nixpkgs = flake.inputs.nixpkgs;
+              sys = nixpkgs.lib.nixosSystem {
+                system = "x86_64-linux";
+                modules = [
+                  flake.nixosModules.default
+                  {
+                    boot.loader.grub.enable = false;
+                    fileSystems."/" = { device = "/dev/null"; fsType = "ext4"; };
+                    system.stateVersion = "24.11";
+                    programs.tabby.enable = true;
+                  }
+                ];
+              };
+              pkg = sys.config.programs.tabby.package;
+            in
+            assert builtins.elem pkg sys.config.environment.systemPackages;
+            "nixos module ok: ${pkg.name}"
+          '
+
+      - name: Evaluate the Home Manager module
+        run: |
+          nix eval --raw --impure --expr '
+            let
+              flake = builtins.getFlake (toString ./.);
+              pkgs = import flake.inputs.nixpkgs { system = "x86_64-linux"; };
+              lib = pkgs.lib;
+              # Home Manager is not an input here, so stub the two options the
+              # module touches rather than pulling in the whole framework.
+              res = lib.evalModules {
+                modules = [
+                  flake.homeManagerModules.default
+                  {
+                    options = {
+                      home.packages = lib.mkOption {
+                        type = lib.types.listOf lib.types.package;
+                        default = [ ];
+                      };
+                      assertions = lib.mkOption {
+                        type = lib.types.listOf lib.types.unspecified;
+                        default = [ ];
+                      };
+                    };
+                  }
+                  {
+                    _module.args = { inherit pkgs; };
+                    programs.tabby.enable = true;
+                  }
+                ];
+              };
+            in
+            assert lib.filter (a: !a.assertion) res.config.assertions == [ ];
+            "home-manager module ok: ${(builtins.head res.config.home.packages).name}"
+          '

@@ -1,0 +1,14 @@
+{
+  "version": "1.0.238",
+  "urlTemplate": "https://github.com/Eugeny/tabby/releases/download/v@version@/tabby-@version@-linux-@arch@.deb",
+  "platforms": {
+    "x86_64-linux": {
+      "arch": "x64",
+      "hash": "sha256-XqK5qoTytc3LmMt+lL09kt5IyWJUqYtSvy0fMKUtHRw="
+    },
+    "aarch64-linux": {
+      "arch": "arm64",
+      "hash": "sha256-p544FFW44dn04lOqNCMj4utNM+ogTn7C1R3NncehN9A="
+    }
+  }
+}

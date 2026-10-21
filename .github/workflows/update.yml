@@ -1,0 +1,226 @@
+# Watches https://github.com/Eugeny/tabby/releases and publishes a new flake
+# revision whenever Tabby ships a newer .deb.
+#
+# The cycle is: discover -> build on every supported arch -> only then commit,
+# tag and release. A version that does not build never reaches main.
+name: update
+
+on:
+  schedule:
+    # Every six hours. Tabby ships irregularly, so polling beats guessing.
+    - cron: "41 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Pin a specific Tabby version instead of the newest"
+        type: string
+        required: false
+      pre:
+        description: "Consider upstream pre-releases as well"
+        type: boolean
+        default: false
+      force:
+        description: "Rebuild/republish even if sources.json is already current"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Discover and build, but do not commit, tag or release"
+        type: boolean
+        default: false
+
+concurrency:
+  group: tabby-update
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    outputs:
+      updated: ${{ steps.update.outputs.updated }}
+      version: ${{ steps.update.outputs.version }}
+      old-version: ${{ steps.update.outputs.old-version }}
+      changelog: ${{ steps.update.outputs.changelog }}
+      systems: ${{ steps.update.outputs.systems }}
+      proceed: ${{ steps.decide.outputs.proceed }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Discover the newest Tabby release
+        id: update
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          nix run .#update -- \
+            ${{ inputs.version && format('--version {0}', inputs.version) || '' }} \
+            ${{ inputs.pre && '--pre' || '' }}
+
+      - name: Decide whether to build
+        id: decide
+        run: |
+          if [ "${{ steps.update.outputs.updated }}" = "true" ] || [ "${{ inputs.force }}" = "true" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "### Tabby update check"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| pinned | \`${{ steps.update.outputs.old-version }}\` |"
+            echo "| upstream | \`${{ steps.update.outputs.version }}\` |"
+            echo "| action | ${{ steps.decide.outputs.proceed == 'true' && 'build & publish' || 'nothing to do' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Carries the rewritten pin to the build/publish jobs so the version is
+      # resolved exactly once per run.
+      - name: Upload sources.json
+        if: steps.decide.outputs.proceed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sources-json
+          path: pkgs/tabby/sources.json
+          if-no-files-found: error
+
+  build:
+    needs: discover
+    if: needs.discover.outputs.proceed == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sources-json
+          path: pkgs/tabby/
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      # Each Tabby build is ~700 MB unpacked on top of a 130 MB .deb; the
+      # hosted runners need the headroom.
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Build Tabby ${{ needs.discover.outputs.version }} for ${{ matrix.system }}
+        run: |
+          # The flake evaluates out of the git tree; staging the downloaded
+          # pin guarantees it is visible regardless of dirty-tree handling.
+          git add -f pkgs/tabby/sources.json
+          nix build --print-build-logs --no-link \
+            ".#checks.${{ matrix.system }}.tabby" \
+            ".#checks.${{ matrix.system }}.tabby-startup"
+
+      - name: Report what was built
+        run: |
+          out=$(nix build --no-link --print-out-paths ".#packages.${{ matrix.system }}.tabby-terminal")
+          echo "built: $out ($(du -sh "$out" | cut -f1))"
+          echo "- \`${{ matrix.system }}\`: \`$out\`" >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: [discover, build]
+    if: needs.discover.outputs.proceed == 'true' && inputs.dry_run != true
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sources-json
+          path: pkgs/tabby/
+
+      - name: Commit the new pin
+        id: commit
+        env:
+          VERSION: ${{ needs.discover.outputs.version }}
+          OLD_VERSION: ${{ needs.discover.outputs.old-version }}
+          SYSTEMS: ${{ needs.discover.outputs.systems }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet -- pkgs/tabby/sources.json; then
+            echo "sources.json unchanged (forced rebuild of an existing pin)"
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git add pkgs/tabby/sources.json
+          git commit -m "tabby: ${OLD_VERSION} -> ${VERSION}" \
+                     -m "Pinned from https://github.com/Eugeny/tabby/releases for: ${SYSTEMS}" \
+                     -m "Verified by a full nix build on every pinned system."
+          git push origin HEAD:${GITHUB_REF_NAME}
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.discover.outputs.version }}
+          OLD_VERSION: ${{ needs.discover.outputs.old-version }}
+          CHANGELOG: ${{ needs.discover.outputs.changelog }}
+          SYSTEMS: ${{ needs.discover.outputs.systems }}
+        run: |
+          tag="v${VERSION}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists, nothing to do"
+            exit 0
+          fi
+
+          notes=$(cat <<EOF
+          Packages **Tabby ${VERSION}**, pinned from upstream's official
+          \`.deb\` release at
+          [github.com/Eugeny/tabby](https://github.com/Eugeny/tabby/releases/tag/v${VERSION}).
+
+          - Upstream changelog: ${CHANGELOG}
+          - Systems: \`${SYSTEMS}\`
+          - Previous pin: \`${OLD_VERSION}\`
+
+          \`\`\`nix
+          inputs.tabby.url = "github:${GITHUB_REPOSITORY}/${tag}";
+          \`\`\`
+          EOF
+          )
+
+          git tag -a "$tag" -m "tabby ${VERSION}"
+          git push origin "$tag"
+          gh release create "$tag" --title "Tabby ${VERSION}" --notes "$notes"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published Tabby ${{ needs.discover.outputs.version }}"
+            echo
+            echo "- tag: \`v${{ needs.discover.outputs.version }}\`"
+            echo "- systems: \`${{ needs.discover.outputs.systems }}\`"
+            echo "- changelog: ${{ needs.discover.outputs.changelog }}"
+          } >> "$GITHUB_STEP_SUMMARY"
