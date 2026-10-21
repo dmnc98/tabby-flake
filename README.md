@@ -158,6 +158,10 @@ window or a terminal that refuses to open a tab:
   DT_NEEDED entry records it and `autoPatchelfHook` cannot catch it
 - `bin/tabby` is executable, and the `.desktop` file's `Exec`/`Icon` point at
   the wrapper and the installed icons
+- `bin/tabby` is a *shell* wrapper, so the conditional Wayland flags expand at
+  launch — `wrapGAppsHook3` propagates `makeBinaryWrapper`, whose `makeWrapper`
+  would shadow the shell one and hand Electron `${NIXOS_OZONE_WL:+...}` as
+  literal text
 - the Electron bundle still has `resources.pak`, `icudtl.dat`,
   `snapshot_blob.bin` and `resources/app.asar`
 - `node-pty`, `russh`, `keytar` and `fontmanager-redux` survived the prune —

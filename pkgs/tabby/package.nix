@@ -275,6 +275,19 @@ stdenv.mkDerivation (finalAttrs: {
           grep -qx 'Icon=tabby' "$tabby/share/applications/tabby.desktop" \
             || { echo "FAIL: desktop Icon does not match the installed icons" >&2; fail=1; }
 
+          echo "== bin/tabby is a shell wrapper, so the ozone flags expand =="
+          # makeBinaryWrapper, which wrapGAppsHook3 propagates, compiles the
+          # wrapper to C and performs no shell expansion: the conditional
+          # ''${NIXOS_OZONE_WL:+...} would reach Electron as literal text and
+          # Tabby would silently never get the Wayland flags.
+          if head -n1 "$tabby/bin/tabby" | grep -q '^#!'; then
+            grep -q 'NIXOS_OZONE_WL:+' "$tabby/bin/tabby" \
+              || { echo "FAIL: the wrapper lost the NIXOS_OZONE_WL conditional" >&2; fail=1; }
+          else
+            echo "FAIL: bin/tabby is not a shell wrapper (makeShellWrapper shadowed again?)" >&2
+            fail=1
+          fi
+
           echo "== the Electron bundle is intact =="
           # Tabby has no --version that exits, so the binary is never run here.
           # These are the files Electron cannot start without.
